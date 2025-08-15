@@ -56,7 +56,7 @@ function createRendererFactory(
           const marks = [Date.now()]
           const { page, info } = await promise
           marks.push(Date.now())
-          const result = await page.evaluate(`seekToFrame(${i})`)
+          const result = await page.evaluate(frame => seekToFrame(frame), i)
           marks.push(Date.now())
           const buffer =
             typeof result === 'string' && result.startsWith(DATA_URL_PREFIX)
@@ -251,14 +251,15 @@ tkt
       },
     },
     async function main(args) {
-      const renderer = createParallelRender(
-        args.parallelism,
-        createRendererFactory(args.url, {
-          scale: args.scale,
-          alpha: args.alpha,
-        }),
-      )
-      const info = await renderer.getInfo()
+      const startTime = Date.now()
+      // 1) Prepara la fábrica de renderers y un renderer para obtener info
+      const mkRenderer = createRendererFactory(args.url, {
+        scale: args.scale,
+        alpha: args.alpha,
+      })
+
+      const infoRenderer = mkRenderer({ name: 'Info' })
+      const info = await infoRenderer.getInfo()
       console.log('Movie info:', info)
 
       const outputs = []
@@ -273,24 +274,72 @@ tkt
         outputs.push(pngFileOutput(args.png))
       }
 
-      const promises = []
       const start = args.start || 0
       const end = args.end || info.numberOfFrames
-      for (let i = start; i < end; i++) {
-        promises.push({ promise: renderer.render(i), frame: i })
+      const totalFrames = Math.max(0, end - start)
+      if (totalFrames === 0) {
+        for (const o of outputs) o.end()
+        await infoRenderer.end()
+        return
       }
-      for (let i = 0; i < promises.length; i++) {
-        console.log(
-          'Render frame %d %d/%d',
-          promises[i].frame,
-          i,
-          promises.length,
-        )
-        const buffer = await promises[i].promise
-        for (const o of outputs) o.writePNGFrame(buffer, promises[i].frame)
+
+      // 2) Crea N workers fijos (uno por paralelo) y divide el rango en segmentos contiguos
+      const parallelism = Math.min(args.parallelism || require('os').cpus().length, totalFrames)
+      const workers = new Array(parallelism)
+      workers[0] = infoRenderer // Reaprovechamos el que ya abrió el browser
+      for (let w = 1; w < parallelism; w++) {
+        workers[w] = mkRenderer({ name: `Worker ${w + 1}` })
       }
+
+      const chunkSize = Math.ceil(totalFrames / parallelism)
+
+      // 3) Esquema de escritura en orden (coordinador)
+      const pending = new Map()         // frameNumber -> Buffer
+      let nextToWrite = start
+      let flushing = false
+
+      async function deliver(frame, buffer) {
+        pending.set(frame, buffer)
+        if (flushing) return
+        flushing = true
+        try {
+          // Escribe estrictamente en orden, sin saltos
+          while (pending.has(nextToWrite)) {
+            const buf = pending.get(nextToWrite)
+            pending.delete(nextToWrite)
+            for (const o of outputs) o.writePNGFrame(buf, nextToWrite)
+            nextToWrite++
+          }
+        } finally {
+          flushing = false
+        }
+      }
+
+      // 4) Lanza un job por worker: cada uno recorre su segmento en orden ascendente
+      const jobs = workers.map(async (renderer, idx) => {
+        const from = start + idx * chunkSize
+        const to = Math.min(end, from + chunkSize)
+        if (from >= to) return
+
+        console.log(`Worker ${idx + 1} -> frames [${from}, ${to})`)
+        for (let i = from; i < to; i++) {
+          // Render en secuencia para este worker
+          const buffer = await renderer.render(i)
+          await deliver(i, buffer)
+        }
+      })
+
+      // 5) Espera a que terminen todos los segmentos
+      await Promise.all(jobs)
+
+      // 6) Cierra salidas y workers
       for (const o of outputs) o.end()
-      renderer.end()
+      await Promise.all(workers.map(w => w.end()))
+      const endTime = Date.now()
+      const diff = Math.floor((endTime - startTime)/1000)
+      const mins = Math.floor(diff / 60)
+      const secs = diff % 60
+      console.log(`Render time: ${mins}:${secs}`)
     },
   )
   .command('server', 'Starts a rendering server', {}, async () => {
