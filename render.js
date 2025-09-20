@@ -160,12 +160,13 @@ function ffmpegOutput(fps, outPath, { alpha }) {
     ...(alpha
       ? [
           // https://stackoverflow.com/a/12951156/559913
-          ...['-c:v', 'qtrle'],
+          // ...['-c:v', 'qtrle'],
 
           // https://unix.stackexchange.com/a/111897
-          // ...['-c:v', 'prores_ks'],
-          // ...['-pix_fmt', 'yuva444p10le'],
-          // ...['-profile:v', '4444'],
+          // premiere friendly
+          ...['-c:v', 'prores_ks'],
+          ...['-pix_fmt', 'yuva444p10le'],
+          ...['-profile:v', '4444'],
           // https://www.ffmpeg.org/ffmpeg-codecs.html#Speed-considerations
           // ...['-qscale', '4']
         ]
