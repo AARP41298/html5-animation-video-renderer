@@ -322,7 +322,7 @@ tkt
         const to = Math.min(end, from + chunkSize)
         if (from >= to) return
 
-        console.log(`Worker ${idx + 1} -> frames [${from}, ${to})`)
+        console.log(`Worker ${idx + 1} -> frames [${from}, ${to}]`)
         for (let i = from; i < to; i++) {
           // Render en secuencia para este worker
           const buffer = await renderer.render(i)
@@ -339,7 +339,7 @@ tkt
       const endTime = Date.now()
       const diff = Math.floor((endTime - startTime)/1000)
       const mins = Math.floor(diff / 60)
-      const secs = diff % 60
+      const secs = (diff % 60).toString().padStart(2, '0')
       console.log(`Render time: ${mins}:${secs}`)
     },
   )
