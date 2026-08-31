@@ -1,8 +1,12 @@
 const puppeteer = require('puppeteer')
 const spawn = require('child_process').spawn
+const { once } = require('events')
 const tkt = require('tkt')
 const fs = require('fs')
 const path = require('path')
+
+// Windows named pipes reject large writes (errno -4094 / UNKNOWN).
+const PIPE_CHUNK_SIZE = 64 * 1024
 
 function createRendererFactory(
   url,
@@ -18,28 +22,41 @@ function createRendererFactory(
       page.on('console', (msg) => console.log('PAGE LOG:', msg.text()))
       page.on('pageerror', (msg) => console.log('PAGE ERROR:', msg))
       await page.goto(url, { waitUntil: 'load' })
-      const info = await page.evaluate(`(async () => {
+      const dimensions = await page.evaluate(`(async () => {
         let deadline = Date.now() + 10000
         while (Date.now() < deadline) {
-          if (typeof getInfo === 'function') {
-            break
+          const scene = document.querySelector('#scene')
+          if (scene && scene.offsetWidth && scene.offsetHeight) {
+            return { width: scene.offsetWidth, height: scene.offsetHeight }
           }
-          await new Promise(r => setTimeout(r, 1000))
+          await new Promise(r => setTimeout(r, 100))
         }
-        const info = await getInfo()
-        if (!info.width || !info.height) {
-          Object.assign(info, {
-            width: document.querySelector('#scene').offsetWidth,
-            height: document.querySelector('#scene').offsetHeight,
-          })
-        }
-        return info
+        throw new Error('Timed out waiting for #scene dimensions')
       })()`)
       await page.setViewport({
-        width: info.width,
-        height: info.height,
+        width: dimensions.width,
+        height: dimensions.height,
         deviceScaleFactor: scale,
       })
+      const info = await page.evaluate(
+        async (width, height) => {
+          let deadline = Date.now() + 10000
+          while (Date.now() < deadline) {
+            if (typeof getInfo === 'function') {
+              break
+            }
+            await new Promise((r) => setTimeout(r, 100))
+          }
+          if (typeof getInfo !== 'function') {
+            throw new Error('Timed out waiting for getInfo()')
+          }
+          const info = await getInfo()
+          Object.assign(info, { width, height })
+          return info
+        },
+        dimensions.width,
+        dimensions.height,
+      )
       return { browser, page, info }
     })()
     let rendering = false
@@ -182,12 +199,57 @@ function ffmpegOutput(fps, outPath, { alpha }) {
   ])
   ffmpeg.stderr.pipe(process.stderr)
   ffmpeg.stdout.pipe(process.stdout)
+
+  let stdinError = null
+  ffmpeg.stdin.on('error', (err) => {
+    stdinError = err
+  })
+  ffmpeg.on('error', (err) => {
+    stdinError = stdinError || err
+  })
+
+  async function writeFully(buffer) {
+    if (stdinError) throw stdinError
+    if (!ffmpeg.stdin.writable) {
+      throw stdinError || new Error('ffmpeg stdin is closed')
+    }
+    for (let offset = 0; offset < buffer.length; ) {
+      if (stdinError) throw stdinError
+      const chunk = buffer.subarray(
+        offset,
+        Math.min(offset + PIPE_CHUNK_SIZE, buffer.length),
+      )
+      offset += chunk.length
+      let ok
+      try {
+        ok = ffmpeg.stdin.write(chunk)
+      } catch (err) {
+        throw stdinError || err
+      }
+      if (!ok) await once(ffmpeg.stdin, 'drain')
+    }
+  }
+
   return {
-    writePNGFrame(buffer, _frameNumber) {
-      ffmpeg.stdin.write(buffer)
+    async writePNGFrame(buffer, _frameNumber) {
+      await writeFully(buffer)
     },
-    end() {
-      ffmpeg.stdin.end()
+    async end() {
+      if (ffmpeg.stdin.writable) {
+        ffmpeg.stdin.end()
+      }
+      const [code, signal] = await once(ffmpeg, 'close')
+      if (code && code !== 0) {
+        throw new Error(
+          `ffmpeg exited with code ${code}${signal ? ` signal ${signal}` : ''}`,
+        )
+      }
+    },
+    destroy() {
+      try {
+        if (ffmpeg.stdin.writable) ffmpeg.stdin.destroy()
+      } catch (_) {}
+      if (!ffmpeg.killed) ffmpeg.kill()
     },
   }
 }
@@ -279,7 +341,7 @@ tkt
       const end = args.end || info.numberOfFrames
       const totalFrames = Math.max(0, end - start)
       if (totalFrames === 0) {
-        for (const o of outputs) o.end()
+        for (const o of outputs) await o.end()
         await infoRenderer.end()
         return
       }
@@ -297,45 +359,50 @@ tkt
       // 3) Esquema de escritura en orden (coordinador)
       const pending = new Map()         // frameNumber -> Buffer
       let nextToWrite = start
-      let flushing = false
+      let writeQueue = Promise.resolve()
 
-      async function deliver(frame, buffer) {
+      function deliver(frame, buffer) {
         pending.set(frame, buffer)
-        if (flushing) return
-        flushing = true
-        try {
-          // Escribe estrictamente en orden, sin saltos
+        writeQueue = writeQueue.then(async () => {
           while (pending.has(nextToWrite)) {
             const buf = pending.get(nextToWrite)
             pending.delete(nextToWrite)
-            for (const o of outputs) o.writePNGFrame(buf, nextToWrite)
+            for (const o of outputs) await o.writePNGFrame(buf, nextToWrite)
             nextToWrite++
           }
-        } finally {
-          flushing = false
-        }
+        })
+        return writeQueue
       }
 
-      // 4) Lanza un job por worker: cada uno recorre su segmento en orden ascendente
-      const jobs = workers.map(async (renderer, idx) => {
-        const from = start + idx * chunkSize
-        const to = Math.min(end, from + chunkSize)
-        if (from >= to) return
+      try {
+        // 4) Lanza un job por worker: cada uno recorre su segmento en orden ascendente
+        const jobs = workers.map(async (renderer, idx) => {
+          const from = start + idx * chunkSize
+          const to = Math.min(end, from + chunkSize)
+          if (from >= to) return
 
-        console.log(`Worker ${idx + 1} -> frames [${from}, ${to}]`)
-        for (let i = from; i < to; i++) {
-          // Render en secuencia para este worker
-          const buffer = await renderer.render(i)
-          await deliver(i, buffer)
+          console.log(`Worker ${idx + 1} -> frames [${from}, ${to}]`)
+          for (let i = from; i < to; i++) {
+            // Render en secuencia para este worker
+            const buffer = await renderer.render(i)
+            await deliver(i, buffer)
+          }
+        })
+
+        // 5) Espera a que terminen todos los segmentos y se vacíe el pipe a ffmpeg
+        await Promise.all(jobs)
+        await writeQueue
+
+        // 6) Cierra salidas
+        for (const o of outputs) await o.end()
+      } catch (err) {
+        for (const o of outputs) {
+          if (typeof o.destroy === 'function') o.destroy()
         }
-      })
-
-      // 5) Espera a que terminen todos los segmentos
-      await Promise.all(jobs)
-
-      // 6) Cierra salidas y workers
-      for (const o of outputs) o.end()
-      await Promise.all(workers.map(w => w.end()))
+        throw err
+      } finally {
+        await Promise.all(workers.map((w) => w.end()))
+      }
       const endTime = Date.now()
       const diff = Math.floor((endTime - startTime)/1000)
       const mins = Math.floor(diff / 60)
