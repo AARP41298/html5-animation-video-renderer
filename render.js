@@ -169,24 +169,41 @@ function createParallelRender(max, rendererFactory) {
   }
 }
 
-function ffmpegOutput(fps, outPath, { alpha }) {
+function ffmpegOutput(fps, outPath, { alpha, vulkan }) {
+  const useVulkan = Boolean(alpha && vulkan)
+  const encoder = useVulkan
+    ? 'prores_ks_vulkan (GPU)'
+    : alpha
+      ? 'prores_ks (CPU)'
+      : 'libx264 (CPU)'
+  console.log('ffmpeg encoder:', encoder)
+
   const ffmpeg = spawn('ffmpeg', [
+    ...(useVulkan
+      ? ['-init_hw_device', 'vulkan=vk', '-filter_hw_device', 'vk']
+      : []),
     ...['-f', 'image2pipe'],
     ...['-framerate', `${fps}`],
     ...['-i', '-'],
     ...(alpha
-      ? [
-          // https://stackoverflow.com/a/12951156/559913
-          // ...['-c:v', 'qtrle'],
+      ? useVulkan
+        ? [
+            ...['-vf', 'format=yuva444p10le,hwupload'],
+            ...['-c:v', 'prores_ks_vulkan'],
+            ...['-profile:v', '4444'],
+          ]
+        : [
+            // https://stackoverflow.com/a/12951156/559913
+            // ...['-c:v', 'qtrle'],
 
-          // https://unix.stackexchange.com/a/111897
-          // premiere friendly
-          ...['-c:v', 'prores_ks'],
-          ...['-pix_fmt', 'yuva444p10le'],
-          ...['-profile:v', '4444'],
-          // https://www.ffmpeg.org/ffmpeg-codecs.html#Speed-considerations
-          // ...['-qscale', '4']
-        ]
+            // https://unix.stackexchange.com/a/111897
+            // premiere friendly
+            ...['-c:v', 'prores_ks'],
+            ...['-pix_fmt', 'yuva444p10le'],
+            ...['-profile:v', '4444'],
+            // https://www.ffmpeg.org/ffmpeg-codecs.html#Speed-considerations
+            // ...['-qscale', '4']
+          ]
       : [
           ...['-c:v', 'libx264'],
           ...['-crf', '16'],
@@ -289,11 +306,20 @@ tkt
         default: require('os').cpus().length,
       },
       start: {
-        description: 'Frame number to start rendering',
+        description: 'Time in seconds to start rendering',
         type: 'number',
         default: 0,
       },
       end: {
+        description:
+          'Time in seconds to end rendering (that time will not be rendered)',
+        type: 'number',
+      },
+      frame_start: {
+        description: 'Frame number to start rendering',
+        type: 'number',
+      },
+      frame_end: {
         description:
           'Frame number to end rendering (that frame number will not be rendered)',
         type: 'number',
@@ -307,6 +333,11 @@ tkt
           'Renders a image/video with alpha transparency. For video, the file extension MUST be .mov',
         type: 'boolean',
       },
+      vulkan: {
+        description:
+          'Encode ProRes 4444 with prores_ks_vulkan (GPU). Requires --alpha and FFmpeg 8.1+',
+        type: 'boolean',
+      },
       scale: {
         description: 'Device scale factor',
         type: 'number',
@@ -315,6 +346,11 @@ tkt
     },
     async function main(args) {
       const startTime = Date.now()
+      if (args.vulkan && !args.alpha) {
+        console.log(
+          'Note: --vulkan only applies to ProRes with --alpha; ignoring for this run',
+        )
+      }
       // 1) Prepara la fábrica de renderers y un renderer para obtener info
       const mkRenderer = createRendererFactory(args.url, {
         scale: args.scale,
@@ -330,6 +366,7 @@ tkt
         outputs.push(
           ffmpegOutput(info.fps, args.video, {
             alpha: args.alpha,
+            vulkan: args.vulkan,
           }),
         )
       }
@@ -337,8 +374,25 @@ tkt
         outputs.push(pngFileOutput(args.png))
       }
 
-      const start = args.start || 0
-      const end = args.end || info.numberOfFrames
+      const fps = info.fps
+      const frameStart = args.frame_start != null ? args.frame_start : args.frameStart
+      const frameEnd = args.frame_end != null ? args.frame_end : args.frameEnd
+      const start =
+        frameStart != null
+          ? frameStart
+          : Math.round((args.start || 0) * fps)
+      const end =
+        frameEnd != null
+          ? frameEnd
+          : args.end != null
+            ? Math.round(args.end * fps)
+            : info.numberOfFrames
+      console.log(
+        'Render range: frames [%d, %d) @ %d fps',
+        start,
+        end,
+        fps,
+      )
       const totalFrames = Math.max(0, end - start)
       if (totalFrames === 0) {
         for (const o of outputs) await o.end()
